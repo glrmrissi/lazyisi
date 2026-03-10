@@ -21,11 +21,16 @@ pub fn draw(f: &mut Frame, app: &App) {
 
     let left = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
+        .constraints([
+            Constraint::Percentage(50),
+            Constraint::Percentage(25),
+            Constraint::Percentage(25),
+        ])
         .split(horizontal[0]);
 
     draw_files(f, app, left[0]);
     draw_log(f, app, left[1]);
+    draw_tree_files(f, app, left[2]);
     draw_diff(f, app, horizontal[1]);
     draw_statusbar(f, app, vertical[1]);
 
@@ -124,7 +129,6 @@ fn draw_files(f: &mut Frame, app: &App, area: Rect) {
     );
 
     let mut state = ListState::default();
-    // offset by header items when selecting
     if let Some(idx) = selected_flat_idx {
         let header_count = usize::from(!app.unstaged.is_empty())
             + usize::from(!app.untracked.is_empty() && app.file_section == FileSection::Untracked);
@@ -179,6 +183,59 @@ fn draw_log(f: &mut Frame, app: &App, area: Rect) {
     let mut state = ListState::default();
     if app.pane == Pane::Log && !app.log.is_empty() {
         state.select(Some(app.log_idx));
+    }
+    f.render_stateful_widget(list, area, &mut state);
+}
+
+fn draw_tree_files(f: &mut Frame, app: &App, area: Rect) {
+    let items: Vec<ListItem> = if app.tree_files.is_empty() {
+        vec![ListItem::new(Line::from(Span::styled(
+            "  select a commit above",
+            Style::default().fg(Color::DarkGray),
+        )))]
+    } else {
+        app.tree_files
+            .iter()
+            .enumerate()
+            .map(|(i, (mode, name, hash))| {
+                let is_sel = app.pane == Pane::TreeFiles && i == app.tree_file_idx;
+                let style = if is_sel {
+                    Style::default().bg(Color::DarkGray).fg(Color::White)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                let kind = if mode == "40000" { "tree" } else { "blob" };
+                ListItem::new(Line::from(vec![
+                    Span::styled(format!(" {kind} "), style.fg(Color::Blue)),
+                    Span::styled(name.clone(), style),
+                    Span::styled(format!("  {}", &hash[..7]), style.fg(Color::DarkGray)),
+                ]))
+            })
+            .collect()
+    };
+
+    let border_style = if app.pane == Pane::TreeFiles {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+
+    let title = if let Some(commit) = app.log.get(app.log_idx) {
+        format!(" Tree @ {} ", &commit.hash[..7])
+    } else {
+        " Tree ".to_string()
+    };
+
+    let list = List::new(items).block(
+        Block::default()
+            .title(title)
+            .borders(Borders::ALL)
+            .border_style(border_style),
+    );
+
+    let mut state = ListState::default();
+    if app.pane == Pane::TreeFiles && !app.tree_files.is_empty() {
+        state.select(Some(app.tree_file_idx));
     }
     f.render_stateful_widget(list, area, &mut state);
 }

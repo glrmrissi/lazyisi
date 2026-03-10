@@ -18,6 +18,7 @@ use isi::store::repo::find_root;
 pub enum Pane {
     Files,
     Log,
+    TreeFiles,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -70,6 +71,9 @@ pub struct App {
     pub untracked_idx: usize,
     pub log_idx: usize,
 
+    pub tree_files: Vec<(String, String, String)>,
+    pub tree_file_idx: usize,
+
     pub diff: Vec<DiffLine>,
     pub diff_scroll: usize,
 
@@ -92,6 +96,8 @@ impl App {
             unstaged_idx: 0,
             untracked_idx: 0,
             log_idx: 0,
+            tree_files: vec![],
+            tree_file_idx: 0,
             diff: vec![],
             diff_scroll: 0,
             mode: Mode::Normal,
@@ -227,10 +233,59 @@ impl App {
 
     pub fn update_diff(&mut self) {
         self.diff_scroll = 0;
+        if self.pane == Pane::Log || self.pane == Pane::TreeFiles {
+            self.load_tree_files_for_selected();
+        }
         self.diff = match self.pane {
             Pane::Files => self.compute_file_diff(),
             Pane::Log => self.compute_commit_diff(),
+            Pane::TreeFiles => self.compute_tree_file_content(),
         };
+    }
+
+    fn load_tree_files_for_selected(&mut self) {
+        let commit = match self.log.get(self.log_idx) {
+            Some(c) => c.clone(),
+            None => { self.tree_files = vec![]; return; }
+        };
+
+        let data = match read_object(&commit.hash) {
+            Ok(d) => d,
+            Err(_) => { self.tree_files = vec![]; return; }
+        };
+
+        let text = String::from_utf8_lossy(&data).to_string();
+        let tree_hash = text
+            .lines()
+            .find(|l| l.starts_with("tree "))
+            .map(|l| l[5..].trim().to_string());
+
+        self.tree_files = tree_hash
+            .and_then(|h| read_object(&h).ok())
+            .map(|d| parse_tree(&d))
+            .unwrap_or_default();
+
+        if self.tree_file_idx >= self.tree_files.len().max(1) {
+            self.tree_file_idx = self.tree_files.len().saturating_sub(1);
+        }
+    }
+
+    fn compute_tree_file_content(&self) -> Vec<DiffLine> {
+        let (_, name, hash) = match self.tree_files.get(self.tree_file_idx) {
+            Some(e) => e,
+            None => return vec![DiffLine::Context("  (no files in tree)".to_string())],
+        };
+
+        let data = match read_object(hash) {
+            Ok(d) => d,
+            Err(_) => return vec![DiffLine::Header(format!("error reading blob {}", &hash[..7]))],
+        };
+
+        let mut lines = vec![DiffLine::Header(format!("{name}  @ {}", &hash[..7]))];
+        for line in String::from_utf8_lossy(&data).lines() {
+            lines.push(DiffLine::Context(line.to_string()));
+        }
+        lines
     }
 
     fn compute_file_diff(&self) -> Vec<DiffLine> {
@@ -308,14 +363,44 @@ impl App {
         };
 
         let text = String::from_utf8_lossy(&data).to_string();
+
         let mut lines = vec![DiffLine::Header(format!("commit {}", commit.hash))];
-        for line in text.lines() {
+        for line in text.lines().take_while(|l| !l.is_empty()) {
             lines.push(DiffLine::Context(line.to_string()));
         }
+
+        let message: String = text
+            .lines()
+            .skip_while(|l| !l.is_empty())
+            .skip(1)
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !message.trim().is_empty() {
+            lines.push(DiffLine::Context(String::new()));
+            lines.push(DiffLine::Header(format!("    {}", message.trim())));
+        }
+
+        let tree_hash = text
+            .lines()
+            .find(|l| l.starts_with("tree "))
+            .map(|l| l[5..].trim().to_string());
+
+        if let Some(hash) = tree_hash {
+            lines.push(DiffLine::Context(String::new()));
+            lines.push(DiffLine::Header("── tree ──────────────────────────────────────".to_string()));
+            if let Ok(tree_data) = read_object(&hash) {
+                for (mode, name, blob_hash) in parse_tree(&tree_data) {
+                    lines.push(DiffLine::Context(format!(
+                        "  {mode}  {name}  ({})",
+                        &blob_hash[..7]
+                    )));
+                }
+            }
+        }
+
         lines
     }
 
-    // Returns true if should quit
     pub fn handle_key(&mut self, key: KeyCode) -> io::Result<bool> {
         match self.mode {
             Mode::CommitInput => self.handle_commit_input(key),
@@ -335,7 +420,8 @@ impl App {
             KeyCode::Tab => {
                 self.pane = match self.pane {
                     Pane::Files => Pane::Log,
-                    Pane::Log => Pane::Files,
+                    Pane::Log => Pane::TreeFiles,
+                    Pane::TreeFiles => Pane::Files,
                 };
                 self.update_diff();
             }
@@ -420,6 +506,17 @@ impl App {
                         self.log_idx = next;
                     }
                 }
+                self.tree_file_idx = 0;
+            }
+            Pane::TreeFiles => {
+                if delta < 0 {
+                    self.tree_file_idx = self.tree_file_idx.saturating_sub(1);
+                } else {
+                    let next = self.tree_file_idx + 1;
+                    if next < self.tree_files.len() {
+                        self.tree_file_idx = next;
+                    }
+                }
             }
         }
         self.update_diff();
@@ -473,4 +570,34 @@ impl App {
         self.refresh()?;
         Ok(())
     }
+}
+
+/// Parses a binary tree object and returns (mode, name, hash_hex) for each entry.
+fn parse_tree(data: &[u8]) -> Vec<(String, String, String)> {
+    let mut entries = Vec::new();
+    let mut i = 0;
+
+    while i < data.len() {
+        let null_pos = match data[i..].iter().position(|&b| b == 0) {
+            Some(p) => i + p,
+            None => break,
+        };
+
+        let header = String::from_utf8_lossy(&data[i..null_pos]);
+        let mut parts = header.splitn(2, ' ');
+        let mode = parts.next().unwrap_or("").to_string();
+        let name = parts.next().unwrap_or("").to_string();
+
+        i = null_pos + 1;
+        if i + 20 > data.len() {
+            break;
+        }
+
+        let hash_hex: String = data[i..i + 20].iter().map(|b| format!("{b:02x}")).collect();
+        i += 20;
+
+        entries.push((mode, name, hash_hex));
+    }
+
+    entries
 }
